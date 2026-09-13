@@ -47,6 +47,7 @@ import {
 	MISSING_KEYS_ERROR_TEXT,
 	NACK_REASONS,
 	NO_MESSAGE_FOUND_ERROR_TEXT,
+	type PreparedMessageRetry,
 	SERVER_ERROR_CODES,
 	toNumber,
 	unixTimestampSeconds,
@@ -132,6 +133,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		uploadPreKeys,
 		sendPeerDataOperationMessage,
 		messageRetryManager,
+		messageRetryCoordinator,
 		registerSocketEndHandler,
 		issuePrivacyTokens,
 		fetchAccountReachoutTimelock,
@@ -580,7 +582,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			// Check if we've exceeded max retries using the new system
 			if (messageRetryManager.hasExceededMaxRetries(msgId)) {
 				logger.debug({ msgId }, 'reached retry limit with new retry manager, clearing')
-				messageRetryManager.markRetryFailed(msgId)
+				messageRetryManager.markRetryFailed(msgId, msgKey.remoteJid ?? undefined)
 				return
 			}
 
@@ -1311,11 +1313,12 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		await msgRetryCache.set(key, newValue)
 	}
 
-	const sendMessagesAgain = async (
+	const sendMessagesAgainPrepared = async (
 		key: WAMessageKey,
 		ids: string[],
 		retryNode: BinaryNode,
-		receiptNode: BinaryNode
+		receiptNode: BinaryNode,
+		preparedRetries: PreparedMessageRetry[]
 	) => {
 		const remoteJid = key.remoteJid!
 		const participant = key.participant || remoteJid
@@ -1336,7 +1339,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					logger.debug({ jid: remoteJid, id }, 'found message in retry cache')
 
 					// Mark retry as successful since we found the message
-					messageRetryManager.markRetrySuccess(id)
+					messageRetryManager.markRetrySuccess(id, remoteJid)
 				}
 			}
 
@@ -1347,7 +1350,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					logger.debug({ jid: remoteJid, id }, 'found message via getMessage')
 					// Also mark as successful if found via getMessage
 					if (messageRetryManager) {
-						messageRetryManager.markRetrySuccess(id)
+						messageRetryManager.markRetrySuccess(id, remoteJid)
 					}
 				}
 			}
@@ -1438,26 +1441,45 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		)
 
 		for (const [i, msg] of msgs.entries()) {
-			if (!ids[i]) continue
+			const id = ids[i]
+			if (!id) continue
 
-			if (msg && (await willSendMessageAgain(ids[i], participant))) {
-				await updateSendMessageAgainCount(ids[i], participant)
-				const msgRelayOpts: MessageRelayOptions = { messageId: ids[i] }
-
-				if (sendToAll) {
-					msgRelayOpts.useUserDevicesCache = false
-				} else {
-					msgRelayOpts.participant = {
-						jid: participant,
-						count: +retryNode.attrs.count!
-					}
+			const preparedRetry = preparedRetries[i]!
+			const resend = async () => {
+				if (preparedRetry.isCancelled() || messageRetryCoordinator.isMessageInvalidated(remoteJid, id)) {
+					logger.debug({ jid: remoteJid, id }, 'skipping retry for edited or revoked message')
+					return
 				}
 
-				await relayMessage(key.remoteJid!, msg, msgRelayOpts)
-			} else {
-				logger.debug({ jid: key.remoteJid, id: ids[i] }, 'recv retry request, but message not available')
+				if (msg && (await willSendMessageAgain(id, participant))) {
+					await updateSendMessageAgainCount(id, participant)
+					const msgRelayOpts: MessageRelayOptions = { messageId: id }
+
+					if (sendToAll) {
+						msgRelayOpts.useUserDevicesCache = false
+					} else {
+						msgRelayOpts.participant = {
+							jid: participant,
+							count: +retryNode.attrs.count!
+						}
+					}
+
+					await relayMessage(key.remoteJid!, msg, msgRelayOpts)
+				} else {
+					logger.debug({ jid: key.remoteJid, id }, 'recv retry request, but message not available')
+				}
 			}
+
+			await messageRetryCoordinator.withMessageLock(remoteJid, id, resend)
 		}
+	}
+
+	const sendMessagesAgain = (key: WAMessageKey, ids: string[], retryNode: BinaryNode, receiptNode: BinaryNode) => {
+		const remoteJid = key.remoteJid!
+		const preparedRetries = ids.map(id => messageRetryCoordinator.prepareRetry(remoteJid, id))
+		return sendMessagesAgainPrepared(key, ids, retryNode, receiptNode, preparedRetries).finally(() => {
+			for (const preparedRetry of preparedRetries) preparedRetry.finish()
+		})
 	}
 
 	const handleReceipt = async (node: BinaryNode) => {
