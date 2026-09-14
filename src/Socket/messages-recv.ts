@@ -577,17 +577,18 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		const { fullMessage } = decodeMessageNode(node, authState.creds.me!.id, authState.creds.me!.lid || '')
 		const { key: msgKey } = fullMessage
 		const msgId = msgKey.id!
+		const retryTo = msgKey.remoteJid ?? undefined
 
 		if (messageRetryManager) {
 			// Check if we've exceeded max retries using the new system
-			if (messageRetryManager.hasExceededMaxRetries(msgId)) {
+			if (messageRetryManager.hasExceededMaxRetries(msgId, retryTo)) {
 				logger.debug({ msgId }, 'reached retry limit with new retry manager, clearing')
-				messageRetryManager.markRetryFailed(msgId, msgKey.remoteJid ?? undefined)
+				messageRetryManager.markRetryFailed(msgId, retryTo)
 				return
 			}
 
 			// Increment retry count using new system
-			const retryCount = messageRetryManager.incrementRetryCount(msgId)
+			const retryCount = messageRetryManager.incrementRetryCount(msgId, retryTo)
 
 			// Use the new retry count for the rest of the logic
 			const key = `${msgId}:${msgKey?.participant}`
@@ -640,16 +641,21 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			// Use new retry manager for phone requests if available
 			if (messageRetryManager) {
 				// Schedule phone request with delay (like whatsmeow)
-				messageRetryManager.schedulePhoneRequest(msgId, async () => {
-					try {
-						const requestId = await requestPlaceholderResend(msgKey)
-						logger.debug(
-							`sendRetryRequest: requested placeholder resend (${requestId}) for message ${msgId} (scheduled)`
-						)
-					} catch (error) {
-						logger.warn({ error, msgId }, 'failed to send scheduled phone request')
-					}
-				})
+				messageRetryManager.schedulePhoneRequest(
+					msgId,
+					async () => {
+						try {
+							const requestId = await requestPlaceholderResend(msgKey)
+							logger.debug(
+								`sendRetryRequest: requested placeholder resend (${requestId}) for message ${msgId} (scheduled)`
+							)
+						} catch (error) {
+							logger.warn({ error, msgId }, 'failed to send scheduled phone request')
+						}
+					},
+					undefined,
+					retryTo
+				)
 			} else {
 				// Fallback to immediate request
 				const msgId = await requestPlaceholderResend(msgKey)
@@ -1322,13 +1328,28 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 	) => {
 		const remoteJid = key.remoteJid!
 		const participant = key.participant || remoteJid
+		const activeIds: string[] = []
+		const activePreparedRetries: PreparedMessageRetry[] = []
+
+		for (const [index, id] of ids.entries()) {
+			const preparedRetry = preparedRetries[index]
+			if (!preparedRetry) continue
+			if (preparedRetry.isCancelled() || messageRetryCoordinator.isMessageInvalidated(remoteJid, id)) {
+				logger.debug({ jid: remoteJid, id }, 'skipping retry for edited or revoked message')
+				continue
+			}
+
+			activeIds.push(id)
+			activePreparedRetries.push(preparedRetry)
+		}
+
+		if (activeIds.length === 0) return
 
 		const retryCount = +retryNode.attrs.count! || 1
-		const msgId = ids[0]
 
 		// Try to get messages from cache first, then fallback to getMessage
 		const msgs: (proto.IMessage | undefined)[] = []
-		for (const id of ids) {
+		for (const id of activeIds) {
 			let msg: proto.IMessage | undefined
 
 			// Try to get from retry cache first if enabled
@@ -1337,9 +1358,6 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				if (cachedMsg) {
 					msg = cachedMsg.message
 					logger.debug({ jid: remoteJid, id }, 'found message in retry cache')
-
-					// Mark retry as successful since we found the message
-					messageRetryManager.markRetrySuccess(id, remoteJid)
 				}
 			}
 
@@ -1348,15 +1366,32 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				msg = await getMessage({ ...key, id })
 				if (msg) {
 					logger.debug({ jid: remoteJid, id }, 'found message via getMessage')
-					// Also mark as successful if found via getMessage
-					if (messageRetryManager) {
-						messageRetryManager.markRetrySuccess(id, remoteJid)
-					}
 				}
 			}
 
 			msgs.push(msg)
 		}
+
+		const retryableIds: string[] = []
+		const retryablePreparedRetries: PreparedMessageRetry[] = []
+		const retryableMessages: (proto.IMessage | undefined)[] = []
+		for (const [index, id] of activeIds.entries()) {
+			const preparedRetry = activePreparedRetries[index]
+			if (!preparedRetry) continue
+			if (preparedRetry.isCancelled() || messageRetryCoordinator.isMessageInvalidated(remoteJid, id)) {
+				logger.debug({ jid: remoteJid, id }, 'skipping retry for edited or revoked message')
+				continue
+			}
+
+			const msg = msgs[index]
+			if (msg) messageRetryManager?.markRetrySuccess(id, remoteJid)
+			retryableIds.push(id)
+			retryablePreparedRetries.push(preparedRetry)
+			retryableMessages.push(msg)
+		}
+
+		if (retryableIds.length === 0) return
+		const msgId = retryableIds[0]
 
 		// if it's the primary jid sending the request
 		// just re-send the message to everyone
@@ -1440,11 +1475,11 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 			'prepared session for retry resend'
 		)
 
-		for (const [i, msg] of msgs.entries()) {
-			const id = ids[i]
+		for (const [i, msg] of retryableMessages.entries()) {
+			const id = retryableIds[i]
 			if (!id) continue
 
-			const preparedRetry = preparedRetries[i]!
+			const preparedRetry = retryablePreparedRetries[i]!
 			const resend = async () => {
 				if (preparedRetry.isCancelled() || messageRetryCoordinator.isMessageInvalidated(remoteJid, id)) {
 					logger.debug({ jid: remoteJid, id }, 'skipping retry for edited or revoked message')
@@ -1470,16 +1505,20 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 				}
 			}
 
-			await messageRetryCoordinator.withMessageLock(remoteJid, id, resend)
+			await resend()
 		}
 	}
 
 	const sendMessagesAgain = (key: WAMessageKey, ids: string[], retryNode: BinaryNode, receiptNode: BinaryNode) => {
 		const remoteJid = key.remoteJid!
 		const preparedRetries = ids.map(id => messageRetryCoordinator.prepareRetry(remoteJid, id))
-		return sendMessagesAgainPrepared(key, ids, retryNode, receiptNode, preparedRetries).finally(() => {
-			for (const preparedRetry of preparedRetries) preparedRetry.finish()
-		})
+		return messageRetryCoordinator
+			.withMessageLocks(remoteJid, ids, () =>
+				sendMessagesAgainPrepared(key, ids, retryNode, receiptNode, preparedRetries)
+			)
+			.finally(() => {
+				for (const preparedRetry of preparedRetries) preparedRetry.finish()
+			})
 	}
 
 	const handleReceipt = async (node: BinaryNode) => {
@@ -1754,7 +1793,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 					}
 				} else {
 					if (messageRetryManager && msg.key.id) {
-						messageRetryManager.cancelPendingPhoneRequest(msg.key.id)
+						messageRetryManager.cancelPendingPhoneRequest(msg.key.id, msg.key.remoteJid ?? undefined)
 					}
 
 					const isNewsletter = isJidNewsletter(msg.key.remoteJid!)

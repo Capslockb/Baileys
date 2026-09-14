@@ -1,3 +1,4 @@
+import { jest } from '@jest/globals'
 import type { proto } from '../../../WAProto/index.js'
 import type { AnyMessageContent } from '../../Types/Message'
 import type { ILogger } from '../../Utils/logger'
@@ -67,6 +68,83 @@ describe('MessageRetryManager.removeRecentMessage', () => {
 	})
 })
 
+describe('MessageRetryManager retry bookkeeping', () => {
+	it('tracks retry limits independently for the same custom id in different destinations', () => {
+		const manager = new MessageRetryManager(noopLogger, 2)
+		const id = 'CUSTOM-ID'
+		const first = 'first@s.whatsapp.net'
+		const second = 'second@s.whatsapp.net'
+
+		expect(manager.incrementRetryCount(id, first)).toBe(1)
+		expect(manager.incrementRetryCount(id, first)).toBe(2)
+
+		expect(manager.hasExceededMaxRetries(id, first)).toBe(true)
+		expect(manager.hasExceededMaxRetries(id, second)).toBe(false)
+	})
+
+	it('clears only the completed destination retry count', () => {
+		const manager = new MessageRetryManager(noopLogger, 2)
+		const id = 'CUSTOM-ID'
+		const first = 'first@s.whatsapp.net'
+		const second = 'second@s.whatsapp.net'
+
+		manager.incrementRetryCount(id, first)
+		manager.incrementRetryCount(id, second)
+		manager.markRetrySuccess(id, first)
+
+		expect(manager.getRetryCount(id, first)).toBe(0)
+		expect(manager.getRetryCount(id, second)).toBe(1)
+	})
+
+	it('clears only the failed destination retry count', () => {
+		const manager = new MessageRetryManager(noopLogger, 2)
+		const id = 'CUSTOM-ID'
+		const first = 'first@s.whatsapp.net'
+		const second = 'second@s.whatsapp.net'
+
+		manager.incrementRetryCount(id, first)
+		manager.incrementRetryCount(id, second)
+		manager.markRetryFailed(id, first)
+
+		expect(manager.getRetryCount(id, first)).toBe(0)
+		expect(manager.getRetryCount(id, second)).toBe(1)
+	})
+
+	it('cancels only the completed destination phone request', () => {
+		jest.useFakeTimers()
+		const manager = new MessageRetryManager(noopLogger, 2)
+		const id = 'CUSTOM-ID'
+		const firstCallback = jest.fn()
+		const secondCallback = jest.fn()
+
+		manager.schedulePhoneRequest(id, firstCallback, 10, 'first@s.whatsapp.net')
+		manager.schedulePhoneRequest(id, secondCallback, 10, 'second@s.whatsapp.net')
+		manager.markRetrySuccess(id, 'first@s.whatsapp.net')
+		jest.advanceTimersByTime(10)
+
+		expect(firstCallback).not.toHaveBeenCalled()
+		expect(secondCallback).toHaveBeenCalledTimes(1)
+		manager.clear()
+		jest.useRealTimers()
+	})
+
+	it('cancels destination-scoped phone requests when cleared', () => {
+		jest.useFakeTimers()
+		const manager = new MessageRetryManager(noopLogger, 2)
+		const firstCallback = jest.fn()
+		const secondCallback = jest.fn()
+
+		manager.schedulePhoneRequest('CUSTOM-ID', firstCallback, 10, 'first@s.whatsapp.net')
+		manager.schedulePhoneRequest('CUSTOM-ID', secondCallback, 10, 'second@s.whatsapp.net')
+		manager.clear()
+		jest.advanceTimersByTime(10)
+
+		expect(firstCallback).not.toHaveBeenCalled()
+		expect(secondCallback).not.toHaveBeenCalled()
+		jest.useRealTimers()
+	})
+})
+
 describe('invalidateRecentMessageForContent', () => {
 	const to = 'chat@s.whatsapp.net'
 	const id = 'MSG-1'
@@ -108,7 +186,7 @@ describe('invalidateRecentMessageForContent', () => {
 		expect(manager.isRecentMessageInvalidated(to, id)).toBe(false)
 	})
 
-	it('marks an edited message invalidated and clears that state when the exact key is reused', () => {
+	it('keeps an edited message invalidated when the exact key is reused', () => {
 		const content = { text: 'edited', edit: { remoteJid: to, fromMe: true, id } } as AnyMessageContent
 
 		expect(invalidateRecentMessageForContent(manager, content)).toBe(true)
@@ -116,7 +194,7 @@ describe('invalidateRecentMessageForContent', () => {
 
 		manager.addRecentMessage(to, id, buildMessage('replacement'))
 
-		expect(manager.isRecentMessageInvalidated(to, id)).toBe(false)
+		expect(manager.isRecentMessageInvalidated(to, id)).toBe(true)
 	})
 
 	it('serializes an in-flight retry before the final edit and invalidation', async () => {
@@ -183,12 +261,41 @@ describe('invalidateRecentMessageForContent', () => {
 })
 
 describe('MessageRetryCoordinator', () => {
+	it('holds every requested message lock for the duration of a batch', async () => {
+		const coordinator = new MessageRetryCoordinator()
+		let enterBatch!: () => void
+		const batchEntered = new Promise<void>(resolve => {
+			enterBatch = resolve
+		})
+		let releaseBatch!: () => void
+		const batchGate = new Promise<void>(resolve => {
+			releaseBatch = resolve
+		})
+		const acquired: string[] = []
+
+		const batch = coordinator.withMessageLocks('target@s.whatsapp.net', ['B', 'A', 'A'], async () => {
+			enterBatch()
+			await batchGate
+		})
+		await batchEntered
+
+		const first = coordinator.withMessageLock('target@s.whatsapp.net', 'A', () => acquired.push('A'))
+		const second = coordinator.withMessageLock('target@s.whatsapp.net', 'B', () => acquired.push('B'))
+		await Promise.resolve()
+		expect(acquired).toEqual([])
+
+		releaseBatch()
+		await Promise.all([batch, first, second])
+		expect(acquired.sort()).toEqual(['A', 'B'])
+	})
+
 	it('cancels a prepared retry even after its bounded invalidation marker is evicted', () => {
 		const coordinator = new MessageRetryCoordinator()
 		const retry = coordinator.prepareRetry('target@s.whatsapp.net', 'TARGET')
 
 		coordinator.invalidateMessage('target@s.whatsapp.net', 'TARGET')
-		for (let index = 0; index < 512; index++) {
+		for (let index = 0; coordinator.isMessageInvalidated('target@s.whatsapp.net', 'TARGET'); index++) {
+			if (index >= 10_000) throw new Error('invalidation marker was not bounded')
 			coordinator.invalidateMessage(`other-${index}@s.whatsapp.net`, `OTHER-${index}`)
 		}
 
@@ -197,14 +304,15 @@ describe('MessageRetryCoordinator', () => {
 		retry.finish()
 	})
 
-	it('keeps a prepared retry cancelled when the exact key becomes available again', () => {
+	it('keeps a prepared retry cancelled when the exact key is cached again', () => {
 		const coordinator = new MessageRetryCoordinator()
+		const manager = new MessageRetryManager(noopLogger, 5, coordinator)
 		const retry = coordinator.prepareRetry('target@s.whatsapp.net', 'TARGET')
 
 		coordinator.invalidateMessage('target@s.whatsapp.net', 'TARGET')
-		coordinator.markMessageAvailable('target@s.whatsapp.net', 'TARGET')
+		manager.addRecentMessage('target@s.whatsapp.net', 'TARGET', buildMessage('replacement'))
 
-		expect(coordinator.isMessageInvalidated('target@s.whatsapp.net', 'TARGET')).toBe(false)
+		expect(coordinator.isMessageInvalidated('target@s.whatsapp.net', 'TARGET')).toBe(true)
 		expect(retry.isCancelled()).toBe(true)
 		retry.finish()
 	})

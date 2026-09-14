@@ -63,10 +63,6 @@ export class MessageRetryCoordinator {
 		return `${to}${MESSAGE_KEY_SEPARATOR}${id}`
 	}
 
-	markMessageAvailable(to: string, id: string): void {
-		this.invalidatedMessages.delete(this.key(to, id))
-	}
-
 	invalidateMessage(to: string, id: string): void {
 		const key = this.key(to, id)
 		this.invalidatedMessages.set(key, true)
@@ -102,6 +98,16 @@ export class MessageRetryCoordinator {
 
 	withMessageLock<T>(to: string, id: string, task: () => Promise<T> | T): Promise<T> {
 		return this.mutex.mutex(this.key(to, id), task)
+	}
+
+	withMessageLocks<T>(to: string, ids: string[], task: () => Promise<T> | T): Promise<T> {
+		const orderedIds = [...new Set(ids)].sort()
+		const lockNext = (index: number): Promise<T> => {
+			const id = orderedIds[index]
+			return id === undefined ? Promise.resolve().then(task) : this.withMessageLock(to, id, () => lockNext(index + 1))
+		}
+
+		return lockNext(0)
 	}
 
 	clear(): void {
@@ -202,7 +208,6 @@ export class MessageRetryManager {
 			message,
 			timestamp: Date.now()
 		})
-		this.coordinator.markMessageAvailable(to, id)
 		const indexedKeys = this.messageKeyIndex.get(id) ?? new Set<string>()
 		indexedKeys.add(keyStr)
 		this.messageKeyIndex.set(id, indexedKeys)
@@ -300,24 +305,25 @@ export class MessageRetryManager {
 	/**
 	 * Increment retry counter for a message
 	 */
-	incrementRetryCount(messageId: string): number {
-		this.retryCounters.set(messageId, (this.retryCounters.get(messageId) || 0) + 1)
+	incrementRetryCount(messageId: string, to?: string): number {
+		const key = this.retryKey(messageId, to)
+		this.retryCounters.set(key, (this.retryCounters.get(key) || 0) + 1)
 		this.statistics.totalRetries++
-		return this.retryCounters.get(messageId)!
+		return this.retryCounters.get(key)!
 	}
 
 	/**
 	 * Get retry count for a message
 	 */
-	getRetryCount(messageId: string): number {
-		return this.retryCounters.get(messageId) || 0
+	getRetryCount(messageId: string, to?: string): number {
+		return this.retryCounters.get(this.retryKey(messageId, to)) || 0
 	}
 
 	/**
 	 * Check if message has exceeded maximum retry attempts
 	 */
-	hasExceededMaxRetries(messageId: string): boolean {
-		return this.getRetryCount(messageId) >= this.maxMsgRetryCount
+	hasExceededMaxRetries(messageId: string, to?: string): boolean {
+		return this.getRetryCount(messageId, to) >= this.maxMsgRetryCount
 	}
 
 	/**
@@ -326,8 +332,8 @@ export class MessageRetryManager {
 	markRetrySuccess(messageId: string, to?: string): void {
 		this.statistics.successfulRetries++
 		// Clean up retry counter for successful message
-		this.retryCounters.delete(messageId)
-		this.cancelPendingPhoneRequest(messageId)
+		this.retryCounters.delete(this.retryKey(messageId, to))
+		this.cancelPendingPhoneRequest(messageId, to)
 		if (to) {
 			this.removeRecentMessage(to, messageId)
 		} else {
@@ -340,8 +346,8 @@ export class MessageRetryManager {
 	 */
 	markRetryFailed(messageId: string, to?: string): void {
 		this.statistics.failedRetries++
-		this.retryCounters.delete(messageId)
-		this.cancelPendingPhoneRequest(messageId)
+		this.retryCounters.delete(this.retryKey(messageId, to))
+		this.cancelPendingPhoneRequest(messageId, to)
 		if (to) {
 			this.removeRecentMessage(to, messageId)
 		} else {
@@ -352,12 +358,18 @@ export class MessageRetryManager {
 	/**
 	 * Schedule a phone request with delay
 	 */
-	schedulePhoneRequest(messageId: string, callback: () => void, delay: number = PHONE_REQUEST_DELAY): void {
+	schedulePhoneRequest(
+		messageId: string,
+		callback: () => void,
+		delay: number = PHONE_REQUEST_DELAY,
+		to?: string
+	): void {
+		const key = this.retryKey(messageId, to)
 		// Cancel any existing request for this message
-		this.cancelPendingPhoneRequest(messageId)
+		this.cancelPendingPhoneRequest(messageId, to)
 
-		this.pendingPhoneRequests[messageId] = setTimeout(() => {
-			delete this.pendingPhoneRequests[messageId]
+		this.pendingPhoneRequests[key] = setTimeout(() => {
+			delete this.pendingPhoneRequests[key]
 			this.statistics.phoneRequests++
 			callback()
 		}, delay)
@@ -368,11 +380,12 @@ export class MessageRetryManager {
 	/**
 	 * Cancel pending phone request
 	 */
-	cancelPendingPhoneRequest(messageId: string): void {
-		const timeout = this.pendingPhoneRequests[messageId]
+	cancelPendingPhoneRequest(messageId: string, to?: string): void {
+		const key = this.retryKey(messageId, to)
+		const timeout = this.pendingPhoneRequests[key]
 		if (timeout) {
 			clearTimeout(timeout)
-			delete this.pendingPhoneRequests[messageId]
+			delete this.pendingPhoneRequests[key]
 			this.logger.debug(`Cancelled pending phone request for message ${messageId}`)
 		}
 	}
@@ -421,6 +434,10 @@ export class MessageRetryManager {
 
 	private keyToString(key: RecentMessageKey): string {
 		return `${key.to}${MESSAGE_KEY_SEPARATOR}${key.id}`
+	}
+
+	private retryKey(messageId: string, to?: string): string {
+		return to ? this.keyToString({ to, id: messageId }) : messageId
 	}
 
 	/** Remove one exact destination/message pair from the retry cache. */
